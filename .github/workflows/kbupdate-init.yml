@@ -1,0 +1,45 @@
+name: should-publish-module-kbupdate
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 0 * * *"
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_TOKEN: ${{secrets.PAT}}
+
+    steps:
+      - name: 🧐 Check to see if the module has been updated since latest zip
+        id: zipcheck
+        run: |
+          $parms = @{
+            Uri                  = "https://catalog.s.download.windowsupdate.com/microsoftupdate/v6/wsusscan/wsusscn2.cab"
+            Method               = "HEAD"
+            SkipHeaderValidation = $true
+            ErrorAction          = "Stop"
+          }
+          $request = Invoke-WebRequest @parms
+          $catalogdate = [datetime]($request.Headers['Last-Modified'] | Select-Object -First 1)
+          $publishdate = (Find-Module kbupdate-library).PublishedDate
+
+          Write-Warning "Module pub date: $publishdate"
+          Write-Warning "Catalog pub date: $catalogdate"
+
+          if ($publishdate -le $catalogdate) { #le for final
+            Write-Output '::set-output name=newpub::true'
+          } else {
+            Write-Output '::set-output name=newpub::false'
+          }
+
+      - name: 👥 Run workflow
+        if: steps.zipcheck.outputs.newpub == 'true'
+        run: |
+          gh repo clone potatoqualitee/release
+          Set-Location release
+          gh workflow run kbupdate.yml
+          Write-Output "Visit https://github.com/potatoqualitee/release/actions/workflows/kbupdate.yml"

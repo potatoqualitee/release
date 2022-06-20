@@ -1,0 +1,168 @@
+name: publish-module-dbatools
+on:
+  workflow_dispatch:
+defaults:
+  run:
+    working-directory: C:\dbatools
+    shell: powershell
+
+jobs:
+  publish:
+    # only windows can sign using powershell
+    runs-on: windows-latest
+    env:
+      # use PAT for all gh commands
+      GITHUB_TOKEN: ${{secrets.PAT}}
+
+    steps:
+      - name: 🧐 Check to see if any PRs have been merged since last release
+        working-directory: C:\
+        id: prcheck
+        run: |
+          $lastreleasedate = (gh release --repo dataplat/dbatools view --json createdAt | ConvertFrom-Json).CreatedAt
+          $newpr = gh pr --repo dataplat/dbatools list --search "is:pr merged:>$lastreleasedate" --json title,url,number,author,files --limit 1000 | ConvertFrom-Json
+
+          if ($newpr) {
+            Write-Output '::set-output name=newpr::true'
+          } else {
+            Write-Output '::set-output name=newpr::false'
+          }
+
+      - name: 👥 Clone dbatools repo
+        if: steps.prcheck.outputs.newpr == 'true'
+        working-directory: C:\
+        run: |
+          gh repo clone dataplat/dbatools
+
+      - name: 🤩 Install and cache helper PowerShell modules
+        if: steps.prcheck.outputs.newpr == 'true'
+        id: psmodulecache
+        uses: potatoqualitee/psmodulecache@v4
+        with:
+          modules-to-cache: helpout
+          shell: powershell
+
+      - name: ➕ Update version
+        if: steps.prcheck.outputs.newpr == 'true'
+        # use pwsh for no BOM
+        shell: pwsh
+        run: |
+          # Get manifest
+          $psd1 = Get-ChildItem *.psd1
+
+          # Update version. Update-ModuleManifest reformats, use replace instead.
+          $manifest = Import-PowerShellDataFile $psd1.FullName
+          [version]$version = $Manifest.ModuleVersion
+          [version]$newversion = "{0}.{1}.{2}" -f $Version.Major, $Version.Minor, ($Version.Build + 1)
+          ((Get-Content $psd1.FullName) -replace $version, $NewVersion) | Out-File $psd1.FullName -Encoding UTF8
+
+      - name: 📝 Prep, sign and publish
+        if: steps.prcheck.outputs.newpr == 'true'
+        env:
+          NUGETAPIKEY: ${{secrets.NUGETAPIKEY}}
+          SECURESTRING: ${{secrets.SECURESTRING}}
+          SIGNCERT: ${{secrets.SIGNCERT}}
+        run: |
+          $psd1 = Get-ChildItem *.psd1
+          Import-Module helpout, $psd1.FullName -Force
+          $null = Find-DbaCommand -Rebuild
+          if (-not (Get-Help Connect-DbaInstance)) {
+              throw "Couldn't import module"
+          }
+
+          # Create allcommands.ps1 and build help file
+          $null = Install-Maml -FunctionRoot functions, internal\functions -Module dbatools -Compact -NoVersion
+
+          # Update DiagnosticQueryScript
+          try {
+            Remove-Item -Path C:\dbatools\bin\diagnosticquery\* -ErrorAction SilentlyContinue
+            $null = Save-DbaDiagnosticQueryScript -Path C:\dbatools\bin\diagnosticquery -ErrorAction Stop
+          } catch {
+            throw $PSItem
+          }
+
+          # Prep for gallery
+          $null = New-Item -Type Directory -Path C:\gallery\dbatools
+          robocopy C:\dbatools C:\gallery\dbatools /S /XF *.psproj* *.git* *.yml *.md /XD .git .github Tests .vscode install.ps1 | Out-String | Out-Null
+
+          # Grrr, Windows and Linux look in different places for external help
+          Copy-Item C:\gallery\dbatools\en-us\dbatools-Help.xml C:\gallery\dbatools\dbatools-Help.xml
+
+          # robocopy gives exit codes other than 0, which breaks github actions
+          if ($LASTEXITCODE -eq 1) {
+            $LASTEXITCODE = 0
+          }
+
+          Remove-Item -Recurse C:\gallery\dbatools\bin\build -ErrorAction Ignore
+          Remove-Item -Recurse C:\gallery\dbatools\bin\projects -ErrorAction Ignore
+          Remove-Item -Recurse C:\gallery\dbatools\bin\StructuredLogger.dll -ErrorAction Ignore
+          Remove-Item C:\dbatools\allcommands.ps1 -ErrorAction Ignore
+
+          # Sign
+          $buffer = [System.Convert]::FromBase64String($env:SIGNCERT)
+          $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::New($buffer, $env:SECURESTRING)
+          $null = Get-ChildItem C:\gallery\dbatools -File -Recurse -Include *.ps1, *.ps1xml, *.psd1, *.psm1, *.pssc, *.psrc, *.cdxml | Set-AuthenticodeSignature -HashAlgorithm SHA256 -Certificate $certificate -TimestampServer http://timestamp.digicert.com
+          $PSDefaultParameterValues["*:Timeout"] = 6000 # 100 minutes
+          $publishparams = @{
+            Path              = "C:\gallery\dbatools"
+            NuGetApiKey       = $env:NUGETAPIKEY
+            SkipAutomaticTags = $true
+            Verbose           = $false
+            Whatif            = $false
+          }
+          try {
+            Publish-Module @publishparams -ErrorAction Stop
+          } catch {
+            $initialerror = $PSItem
+            Write-Output "Publish-Module encountered an error: $initialerror"
+            Write-Output "Checking out registered repositories"
+            Get-PSRepository
+            Find-Module dbatools -ErrorAction SilentlyContinue
+            Start-Sleep 20
+            $manifest = Import-PowerShellDataFile $psd1.FullName
+            [version]$version = $Manifest.ModuleVersion
+            if ((Find-Module dbatools -RequiredVersion "$version")) {
+              Write-Output "Found the updated version, moving on"
+            } else {
+              throw "Publish-Module errored: $initialerror"
+            }
+          }
+
+      - name: ⤴ Commit updated version
+        if: steps.prcheck.outputs.newpr == 'true'
+        run: |
+          git config remote.origin.url 'https://${{secrets.PAT}}@github.com/dataplat/dbatools.git'
+          git config user.name potatoqualitee
+          git config user.email clemaire@gmail.com
+          git commit -am "update version"
+          git push
+          git checkout master
+          git merge development
+          git push
+
+      - name: 🚀 Create a release
+        if: steps.prcheck.outputs.newpr == 'true'
+        run: |
+          # Get module version to tag and title
+          $manifest = Import-PowerShellDataFile *.psd1
+          $version = $Manifest.ModuleVersion
+          $tag = "v$version"
+
+          # Let github generate release notes
+          # If a matching git tag does not yet exist, one will automatically be created
+          gh release create $tag --generate-notes --target master --title $tag
+
+          # create artifact
+          Move-Item C:\gallery\dbatools "C:\gallery\$version"
+          $null = New-Item -Type Directory -Path C:\gallery\dbatools
+          Move-Item "C:\gallery\$version" C:\gallery\dbatools\
+          Compress-Archive -Path C:\gallery\dbatools -DestinationPath "C:\gallery\dbatools-signed.zip"
+          gh release upload $tag "C:\gallery\dbatools-signed.zip"
+
+      - name: 🛠️ Rebuild docs
+        if: steps.prcheck.outputs.newpr == 'true'
+        uses: peter-evans/repository-dispatch@v1
+        with:
+          token: ${{ secrets.PAT }}
+          repository: dataplat/docs
+          event-type: rebuild-pages
