@@ -1,0 +1,190 @@
+name: publish-module-kbupdate
+on:
+  workflow_dispatch:
+defaults:
+  run:
+    working-directory: C:\kbupdate
+    shell: pwsh
+
+jobs:
+  publish:
+    # only windows can sign using powershell
+    runs-on: windows-latest
+    env:
+      # use PAT for all gh commands
+      GITHUB_TOKEN: ${{secrets.PAT}}
+
+    steps:
+      - name: 👥 Clone kbupdate repo
+        working-directory: C:\
+        run: |
+          gh repo clone potatoqualitee/kbupdate
+
+      - name: 🤩 Install and cache helper PowerShell modules
+        id: psmodulecache
+        uses: potatoqualitee/psmodulecache@v4
+        with:
+          modules-to-cache: PSFramework, PSSQLite
+          shell: powershell, pwsh
+
+      - name: ➕ Update versions
+        # use pwsh for no BOM
+        shell: pwsh
+        run: |
+          # Change branch
+          git checkout fixes
+          # Get manifest
+          $psd1 = Get-ChildItem *.psd1
+          # Update version. Update-ModuleManifest reformats, use replace instead.
+          $manifest = Import-PowerShellDataFile $psd1.FullName
+          [version]$version = $Manifest.ModuleVersion
+          [version]$newversion = "{0}.{1}.{2}" -f $Version.Major, $Version.Minor, ($Version.Build + 1)
+          ((Get-Content $psd1.FullName) -replace $version, $NewVersion) | Out-File $psd1.FullName -Encoding UTF8
+
+      - name: 🪠 Update database and copy kbupdate-library to publish directory
+        run: |
+          $null = Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Save-Module kbupdate-library -Path C:\Users\runneradmin\Documents\WindowsPowerShell\Modules
+          Save-Module kbupdate-library -Path C:\Users\runneradmin\Documents\PowerShell\Modules
+          Import-Module kbupdate-library
+          Import-Module ./kbupdate.psm1 -Force
+
+          "Updating kbupdate library" | Write-Warning
+          $db = Update-KbDatabase
+
+          "Copying $db and psd1 to C:\kbupdate-library" | Write-Warning
+          $dir = New-Item -Type Directory -Path C:\kbupdate-library\library -Force -ErrorAction SilentlyContinue
+          Copy-Item -Path $db -Destination $dir
+          Copy-Item -Path (Get-Module kbupdate-library).Path -Destination C:\kbupdate-library
+
+      - name: 📝 Update version, sign and publish
+        env:
+          KBNUGETAPIKEY: ${{secrets.KBNUGETAPIKEY}}
+          SECURESTRING: ${{secrets.SECURESTRING}}
+          SIGNCERT: ${{secrets.SIGNCERT}}
+        run: |
+          $psd1 = Get-ChildItem -Path C:\kbupdate-library\kbupdate-library.psd1
+
+          # update version
+          $manifest = Import-PowerShellDataFile $psd1.FullName
+          [version]$version = $Manifest.ModuleVersion
+          [version]$newversion = "{0}.{1}.{2}" -f $Version.Major, $Version.Minor, ($Version.Build + 1)
+          ((Get-Content $psd1.FullName) -replace $version, $NewVersion) | Out-File $psd1.FullName -Encoding UTF8
+          "Updated version from $version to $newversion" | Write-Warning
+
+          # sign
+          $buffer = [System.Convert]::FromBase64String($env:SIGNCERT)
+          $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::New($buffer, $env:SECURESTRING)
+          $null = Get-ChildItem C:\kbupdate-library -File -Recurse -Include *.ps1, *.ps1xml, *.psd1, *.psm1, *.pssc, *.psrc, *.cdxml | Set-AuthenticodeSignature -Certificate $certificate -TimestampServer http://timestamp.digicert.com
+          $PSDefaultParameterValues["*:Timeout"] = 6000 # 100 minutes
+          $publishparams = @{
+            Path              = "C:\kbupdate-library"
+            NuGetApiKey       = $env:KBNUGETAPIKEY
+            SkipAutomaticTags = $true
+            Verbose           = $false
+            Whatif            = $true
+          }
+          try {
+            Publish-Module @publishparams -ErrorAction Stop
+          } catch {
+            $initialerror = $PSItem
+            Write-Output "Publish-Module encountered an error: $initialerror"
+            Write-Output "Checking out registered repositories"
+            Get-PSRepository
+            Find-Module kbupdate-library -ErrorAction SilentlyContinue
+            Start-Sleep 20
+            $manifest = Import-PowerShellDataFile $psd1.FullName
+            [version]$version = $Manifest.ModuleVersion
+            if ((Find-Module kbupdate-library -RequiredVersion "$version")) {
+              Write-Output "Found the updated version, moving on"
+            } else {
+              throw "Publish-Module errored: $initialerror"
+            }
+          }
+
+      - name: 🪠 Upload db to artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: kbupdate-library
+          path: "C:\\kbupdate-library"
+
+      - name: 📝 Prep, sign and publish
+        if: steps.prcheck.outputs.newpr == 'SKIPIT'
+        env:
+          NUGETAPIKEY: ${{secrets.NUGETAPIKEY}}
+          SECURESTRING: ${{secrets.SECURESTRING}}
+          SIGNCERT: ${{secrets.SIGNCERT}}
+        run: |
+          $psd1 = Get-ChildItem *.psd1
+          # Prep for gallery
+          $null = New-Item -Type Directory -Path C:\gallery\kbupdate
+          robocopy C:\kbupdate C:\gallery\kbupdate /S /XF *.psproj* *.git* *.yml *.md /XD .git .github Tests .vscode install.ps1 | Out-String | Out-Null
+
+          # robocopy gives exit codes other than 0, which breaks github actions
+          if ($LASTEXITCODE -eq 1) {
+            $LASTEXITCODE = 0
+          }
+
+          Remove-Item -Recurse C:\gallery\kbupdate\bin\build -ErrorAction Ignore
+          Remove-Item -Recurse C:\gallery\kbupdate\bin\projects -ErrorAction Ignore
+          Remove-Item -Recurse C:\gallery\kbupdate\bin\StructuredLogger.dll -ErrorAction Ignore
+          Remove-Item C:\kbupdate\allcommands.ps1 -ErrorAction Ignore
+
+          # Sign
+          $buffer = [System.Convert]::FromBase64String($env:SIGNCERT)
+          $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::New($buffer, $env:SECURESTRING)
+          $null = Get-ChildItem C:\gallery\kbupdate -File -Recurse -Include *.ps1, *.ps1xml, *.psd1, *.psm1, *.pssc, *.psrc, *.cdxml | Set-AuthenticodeSignature -Certificate $certificate -TimestampServer http://timestamp.digicert.com
+          $PSDefaultParameterValues["*:Timeout"] = 6000 # 100 minutes
+          $publishparams = @{
+            Path              = "C:\gallery\kbupdate"
+            NuGetApiKey       = $env:NUGETAPIKEY
+            SkipAutomaticTags = $true
+            Verbose           = $false
+            Whatif            = $false
+          }
+          try {
+            Publish-Module @publishparams -ErrorAction Stop
+          } catch {
+            $initialerror = $PSItem
+            Write-Output "Publish-Module encountered an error: $initialerror"
+            Write-Output "Checking out registered repositories"
+            Get-PSRepository
+            Find-Module kbupdate -ErrorAction SilentlyContinue
+            Start-Sleep 20
+            $manifest = Import-PowerShellDataFile $psd1.FullName
+            [version]$version = $Manifest.ModuleVersion
+            if ((Find-Module kbupdate -RequiredVersion "$version")) {
+              Write-Output "Found the updated version, moving on"
+            } else {
+              throw "Publish-Module errored: $initialerror"
+            }
+          }
+
+      # NEED TO ALSO PUBLISH KBUPDATE-LIBRARY
+      - name: ⤴ Commit updated version
+        if: steps.prcheck.outputs.newpr == 'SKIPIT'
+        run: |
+          git config remote.origin.url 'https://${{secrets.PAT}}@github.com/potatoqualitee/kbupdate.git'
+          git config user.name potatoqualitee
+          git config user.email clemaire@gmail.com
+          git commit -am "update version"
+          git push
+
+      - name: 🚀 Create a release
+        if: steps.prcheck.outputs.newpr == 'SKIPIT'
+        run: |
+          # Get module version to tag and title
+          $manifest = Import-PowerShellDataFile *.psd1
+          $version = $Manifest.ModuleVersion
+          $tag = "v$version"
+
+          # Let github generate release notes
+          # If a matching git tag does not yet exist, one will automatically be created
+          gh release create $tag --generate-notes --target main --title $tag
+
+          # create artifact
+          Move-Item C:\gallery\kbupdate "C:\gallery\$version"
+          $null = New-Item -Type Directory -Path C:\gallery\kbupdate
+          Move-Item "C:\gallery\$version" C:\gallery\kbupdate\
+          Compress-Archive -Path C:\gallery\kbupdate -DestinationPath "C:\gallery\kbupdate-signed.zip"
+          gh release upload $tag "C:\gallery\kbupdate-signed.zip"
