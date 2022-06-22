@@ -75,7 +75,7 @@ jobs:
           # sign
           $buffer = [System.Convert]::FromBase64String($env:SIGNCERT)
           $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::New($buffer, $env:SECURESTRING)
-          $null = Get-ChildItem C:\kbupdate-library -File -Recurse -Include *.ps1, *.ps1xml, *.psd1, *.psm1, *.pssc, *.psrc, *.cdxml | Set-AuthenticodeSignature -Certificate $certificate -TimestampServer http://timestamp.digicert.com
+          $null = Get-ChildItem C:\kbupdate-library -File -Recurse -Include *.ps1, *.ps1xml, *.psd1, *.psm1, *.pssc, *.psrc, *.cdxml | Set-AuthenticodeSignature -HashAlgorithm SHA256 -Certificate $certificate -TimestampServer http://timestamp.digicert.com
           $PSDefaultParameterValues["*:Timeout"] = 6000 # 100 minutes
           $publishparams = @{
             Path              = "C:\kbupdate-library"
