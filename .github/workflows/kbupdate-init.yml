@@ -1,8 +1,6 @@
 name: should-publish-module-kbupdate
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 0 * * *"
 defaults:
   run:
     shell: pwsh
