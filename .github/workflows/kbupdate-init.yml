@@ -1,6 +1,8 @@
 name: should-publish-module-kbupdate
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "0 0 * * *"
 defaults:
   run:
     shell: pwsh
@@ -9,9 +11,10 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     env:
-      GITHUB_TOKEN: ${{secrets.PAT}}
+      GITHUB_TOKEN: ${{secrets.NEWPAT}}
 
     steps:
+      - uses: actions/checkout@v2
       - name: 🧐 Check to see if the module has been updated since latest zip
         id: zipcheck
         run: |
@@ -37,7 +40,11 @@ jobs:
       - name: 👥 Run workflow
         if: steps.zipcheck.outputs.newpub == 'true'
         run: |
-          gh repo clone potatoqualitee/release
-          Set-Location release
           gh workflow run kbupdate.yml
-          Write-Output "Visit https://github.com/potatoqualitee/release/actions/workflows/kbupdate.yml"
+          Write-Output "Visit https://github.com/potatoqualitee/releases/actions/workflows/kbupdate.yml"
+
+      - uses: gautamkrishnar/keepalive-workflow@v1
+        with:
+          commit_message: keepalive to prevent workflow deactivation
+          committer_username: github-actions[bot]
+          committer_email: github-actions[bot]@users.noreply.github.com
